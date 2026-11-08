@@ -1,12 +1,12 @@
 # Implicit state machines
 
-This file lists lifecycles whose phase is not one explicit state type. Each entry is a machine read in this tree. The checkout is commit `d97007c32d6340f7ba79ac1dfb5773cc00846448` on `Kemenlith/hermes-agent` `main`. That commit is also on `NousResearch/hermes-agent`. GitHub compare of this fork against upstream `main` reports zero commits ahead. The working tree is clean. Every finding below is unmodified upstream code. This branch has no local or customized application files to rank above them.
+This file lists lifecycles whose phase is not one explicit state type. Each entry is a machine read in this tree. The checkout is commit `d97007c32d6340f7ba79ac1dfb5773cc00846448` on `Kemenlith/hermes-agent` `main`. That commit is also on `NousResearch/hermes-agent`. GitHub compare of this fork against upstream `main` reports zero commits ahead. Every finding below is unmodified upstream code. This branch has no local or customized application files to rank above them.
 
 The published docs live in `website/docs`. This inventory sits at the repo root so it is not a Docusaurus page.
 
 ## Count
 
-26 implicit machines.
+39 implicit machines.
 
 ## Ranked list
 
@@ -16,28 +16,41 @@ Risk and complexity first. There is no local machine to place above an upstream 
 2. Kanban task run
 3. Cron job schedule record
 4. Cron run outcome and in-process flight
-5. Cron execution ledger
-6. Gateway process lifecycle
-7. Messaging adapter connection
-8. Gateway session turn slot
-9. MCP server connection
-10. Background process
-11. Async delegation unit
-12. Credential pool entry
-13. Agent turn control
-14. Context compression cooldown
-15. Goal loop
-16. Local model download job
-17. Bot live delivery ticket
-18. Messaging adapter busy-session guard
-19. Dangerous-command approval
-20. Session transcript status
-21. Hermes update receipt
-22. Desktop boot screen
-23. Browser session health
-24. Code kernel cell
-25. Session heartbeat
-26. In-session todo list
+5. Cron occurrence pending slot
+6. Cron execution ledger
+7. Cron delivery handoff queue
+8. Gateway process lifecycle
+9. Gateway delivery obligation ledger
+10. Platform reconnect queue
+11. Desktop secondary gateway registry
+12. Desktop chat turn flags
+13. TUI gateway detached session
+14. Messaging adapter connection
+15. Gateway session turn slot
+16. MCP server connection
+17. Background process
+18. Async delegation unit
+19. Credential pool entry
+20. Agent turn control
+21. Context compression cooldown
+22. Session handoff between surfaces
+23. Goal loop
+24. Local model download job
+25. Bot live delivery ticket
+26. Messaging adapter busy-session guard
+27. Dangerous-command approval
+28. DM pairing
+29. Hermes update lock
+30. Hermes update receipt
+31. TUI client handshake
+32. TUI composer busy latch
+33. Session transcript status
+34. Full-text index rebuild
+35. Desktop boot screen
+36. Browser session health
+37. Code kernel cell
+38. Session heartbeat
+39. In-session todo list
 
 ## Findings
 
@@ -327,6 +340,149 @@ Risk and complexity first. There is no local machine to place above an upstream 
 - Confidence. High.
 - Origin. Upstream.
 
+### 27. Cron occurrence pending slot
+
+- Files and symbols. `cron/occurrences.py` (`pending_slot_stamp`, `unclaimed_pending_slot`). The job field is `pending_slot`.
+- Implicit representation. A dict `{scheduled_at, at, by}` on the job, or absent. The due scan stamps it when it advances `next_run_at`. `claim_job_for_fire` clears it. A schedule rewrite drops it.
+- Inferred states. No open slot, slot stamped and unclaimed, slot claimed, slot restored once after a dead owner.
+- Inferred transitions. Tick stamps, then claims. A crash after the advance and before the claim leaves the slot. A later scan restores that instant once when the owner is gone or the lease has expired. Catch-up policy then decides whether to fire.
+- Illegal combinations. A pending slot on a one-shot. A malformed `scheduled_at`. A slot whose `by` is this process while the job is not in the running set (treated as orphaned). A slot restored more than once.
+- Why it matters. The tick moves `next_run_at` before dispatch so a crash cannot double-fire. Without the slot, that same crash drops the occurrence. The comment cites a window where the restarted scan sees a future time and nothing ran.
+- Confidence. High.
+- Origin. Upstream.
+
+### 28. Cron delivery handoff queue
+
+- Files and symbols. `cron/delivery_queue.py` table `deliveries`, `_TERMINAL`, table `delivery_tombstones`.
+- Implicit representation. `status TEXT` with a SQL check: pending, delivering, delivered, failed, unknown, suppressed. Owner pid and start time sit beside the status. A tombstone stores the terminal status after the row is pruned.
+- Inferred states. Pending, delivering, delivered, failed, unknown, suppressed.
+- Inferred transitions. The worker enqueues pending. The gateway claims the next row and sets delivering. Send finishes as delivered, failed, or suppressed. A dead owner becomes unknown. Unknown is not retried.
+- Illegal combinations. The check rejects other strings. It still allows `delivering` with `finished_at` set, and a tombstone whose status disagrees with a live row of the same execution id. A second claim of a terminal row must no-op. The writers guard that. The schema does not.
+- Why it matters. A restart can send the same cron brief twice, or mark it unknown and never send it.
+- Confidence. High.
+- Origin. Upstream.
+
+### 29. Gateway delivery obligation ledger
+
+- Files and symbols. `gateway/delivery_ledger.py` (`record_obligation`, `mark_attempting`, `mark_delivered`, `mark_failed`). Column `state` on the ledger table.
+- Implicit representation. `state` is a free `TEXT` column. The module docstring is the transition list: pending, attempting, delivered, failed, abandoned. Retry time, attempt count, and owner pid are separate columns. Ledger errors must not block the send.
+- Inferred states. Not recorded, pending, attempting, delivered, failed, abandoned.
+- Inferred transitions. Record pending before send. Mark attempting immediately before the await. Success becomes delivered. A hard rejection becomes failed. A crash while attempting is ambiguous: the platform may already have the message, so recovery resends with a visible recovered marker. Caps and stale rows become abandoned.
+- Illegal combinations. `attempting` with no owner pid after a crash. `delivered` and a later resend of the same id. `pending` after a partial stream already reached the chat. Two reconnect paths claiming one row. The docstring calls that out.
+- Why it matters. A crash between the model reply and the platform ack drops the answer, or a recovery posts it twice.
+- Confidence. High.
+- Origin. Upstream.
+
+### 30. Platform reconnect queue
+
+- Files and symbols. `gateway/run_adapters.py` (`_reconnect_queue_entry`, `_queue_retryable_fatal_platform`, `_failed_platforms`).
+- Implicit representation. A dict per platform: `attempts`, `next_retry`, `queued_at`, `credential_claim`, `listener_claim`, `predecessor`. Membership in `_failed_platforms` is the queued bit. `next_retry` at infinity is the pause. The live adapter map is a second set.
+- Inferred states. Connected, queued and waiting, queued and retrying, paused, dropped.
+- Inferred transitions. A retryable fatal queues the platform before disconnect. A watcher connects with `is_reconnect`. Success installs the new adapter and drops the queue entry. Pause sets a far `next_retry`. Resume resets attempts. A dead watcher is restarted when a platform is already queued.
+- Illegal combinations. The same platform in `adapters` and `_failed_platforms`. `attempts` climbing while `next_retry` is still in the past and the watcher is dead. A predecessor held after install, so inbound dedup state is dropped.
+- Why it matters. The gateway looks up and receives nothing. A failed reconnect can also leak the previous adapter's file descriptors. Cold boot can drop an offline queue if it is not marked as a reconnect.
+- Confidence. High.
+- Origin. Upstream.
+
+### 31. Desktop secondary gateway registry
+
+- Files and symbols. `apps/desktop/src/store/gateway.ts` `Secondary` (`wantOpen`, `reconnecting`, `reconnectAttempt`, `reconnectTimer`, `retained`, `relayRetainCount`, `retiredByPool`, `pendingConnectionRedial`, `activationLeaseUntil`, `livenessProbeFailures`, `stalledDials`, `connectPromise`).
+- Implicit representation. Each pooled backend is a struct of booleans, counters, timers, and a promise. The socket's own `connectionState` is a separate explicit union. The comments say `retained` must not be honored by the live-work pruner, and `retiredByPool` must block a wake-nudge redial.
+- Inferred states. Closed, dialing, open, reconnect backoff, activation lease, pending redial, retired by the pool, relay-retained, probe-failing.
+- Inferred transitions. Open sets `wantOpen` and dials. Close or error starts backoff unless pruning cleared `wantOpen`. Foreground and relay retains pin the socket. Pool retirement blocks the nudge. An activation lease stops the pruner from disposing a switch target mid-dial. A liveness streak force-closes.
+- Illegal combinations. `wantOpen` false while a reconnect timer is still armed. `retiredByPool` true and a focus nudge dials anyway. Dispose while `activationLeaseUntil` is in the future. `connectionState` open on a socket that no longer answers. `retained` true used as a prune keep, which the comment says pins every warmed socket forever.
+- Why it matters. Profile clicks die mid-dial. Bot relay opens and closes a socket every tick. A tile spins because its backend was pruned.
+- Confidence. High.
+- Origin. Upstream.
+
+### 32. Desktop chat turn flags
+
+- Files and symbols. `apps/desktop/src/app/types.ts` `ClientSessionState` (`busy`, `awaitingResponse`, `turnLive`, `needsInput`, `interrupted`, `adoptedRunningTurn`, `sawAssistantPayload`, `streamId`, `heartbeatSettledStreamId`, `interimBoundaryPending`, `turnStartedAt`, `reasoningEffortPending`).
+- Implicit representation. The turn phase is a cluster of booleans and nullable ids. `turnStartedAt` is a clock seeded at submit. The comment says it is not proof the turn is live. `turnLive` is that proof. A heartbeat can settle a bubble before `message.complete`.
+- Inferred states. Idle, optimistic submit, live stream, awaiting the first token, needs input, interrupted and settling, adopted remote turn, heartbeat settled early.
+- Inferred transitions. Send sets busy and the clock. `message.start` sets `turnLive`. Approval or clarify sets `needsInput`. Cancel sets `interrupted`. A `running=false` heartbeat may settle the stream before the complete frame. The next start or complete clears `heartbeatSettledStreamId`.
+- Illegal combinations. `busy` true and `turnLive` false after the watchdog should have settled. `needsInput` true after the turn ended. `turnStartedAt` set with `turnLive` false treated as a live turn. `heartbeatSettledStreamId` set and a later complete that appends a second bubble.
+- Why it matters. The composer accepts a second send. The sidebar dot stays on "analyzing". A reordered heartbeat duplicates the assistant message.
+- Confidence. High.
+- Origin. Upstream.
+
+### 33. TUI gateway detached session
+
+- Files and symbols. `tui_gateway/server.py` `_detached_ws_transport`. `tui_gateway/session_lifecycle.py` (`_ws_session_is_detached`, `_ws_session_is_orphaned`, `_interrupt_session_turn`). Session dict keys `running`, `transport`, `_finalized`, `_manual_compress_active`, `_turn_cancel_requested`.
+- Implicit representation. A session is a dict. Detached means `transport is _detached_ws_transport` and not `_finalized`. Orphaned means detached and not `running`. Cancel, compress, and running are separate flags.
+- Inferred states. Idle and attached, turn running, client gone but turn still running, detached and idle, finalized, manual compress in progress.
+- Inferred transitions. WebSocket drop parks the session on the drop transport. A grace reaper interrupts an orphan. Resume reattaches under `_session_resume_lock`. `prompt.submit` sets `running`. Manual compress sets `_manual_compress_active` so an interrupt must not kill the compact.
+- Illegal combinations. `_finalized` with `running` true. Detached transport while the socket is still the live one. Reap of a session that reattached between the scan and the pop. `_turn_cancel_requested` during manual compress.
+- Why it matters. Closing a laptop kills a turn that should keep running, or a resume gets a conflict while the old row is still the live one. `session.list` can show a ghost.
+- Confidence. High.
+- Origin. Upstream.
+
+### 34. TUI client handshake
+
+- Files and symbols. `ui-tui/src/gatewayClient.ts` (`ready`, `subscribed`, `reconnectAttempts`, `reconnectTimer`, `bufferedRequests`, `disposed`, `drainGeneration`).
+- Implicit representation. Ready and subscribed are separate bools. Requests that arrive before subscribe go into `bufferedRequests`. `disposed` blocks reconnect. `drainGeneration` guards a replay after a newer attach.
+- Inferred states. Cold, child starting, socket connecting, waiting for `gateway.ready`, subscribed, reconnect scheduled, disposed.
+- Inferred transitions. `gateway.ready` sets `ready` and clears the attempt count. Subscribe flips `subscribed` and drains the buffer. Close schedules backoff unless `disposed`. `kill` sets `disposed`.
+- Illegal combinations. `subscribed` false after a transport swap that forgot to reset it, so events emit into a dead handler. `ready` true with `disposed` true. A drain from an old `drainGeneration` replayed onto the new socket.
+- Why it matters. The TUI stays on "summoning". An approval sent before the handler is registered is dropped or applied to the wrong session.
+- Confidence. High.
+- Origin. Upstream.
+
+### 35. TUI composer busy latch
+
+- Files and symbols. `ui-tui/src/app/uiStore.ts` `buildUiState` (`busy`, `busyInputMode`, `compacting`, `sid`, `status`, `streaming`).
+- Implicit representation. `busy` is a bool. `status` is a free string (`summoning` at boot). `busyInputMode` is `interrupt`, `queue`, or `steer`. `compacting` is a separate bool. `streaming` here is a display preference, not the wire stream.
+- Inferred states. No session, ready, busy, queued for the next turn, compacting, waiting on a status string that is not the same as busy.
+- Inferred transitions. Submit sets busy before the RPC returns. Session events clear it. Compact sets `compacting`. A second submit follows `busyInputMode`.
+- Illegal combinations. `busy` false while the backend is still streaming. `status` still saying queued after busy cleared. `compacting` true with `busy` false. `sid` null with `busy` true.
+- Why it matters. Enter submits twice. A queued line waits until the user hits interrupt. The status line and the composer disagree.
+- Confidence. Medium. The store shape was read. The submit path that sets the flags was not line-read.
+- Origin. Upstream.
+
+### 36. Session handoff between surfaces
+
+- Files and symbols. `hermes_state_gateway.py` (`request_handoff`, `get_handoff_state`, the SQL that sets `running`, `completed`, and `failed`).
+- Implicit representation. `sessions.handoff_state` is a string. Null, pending, running, completed, and failed are the words in the SQL. `handoff_platform` and `handoff_error` are companions. Moves are compare-and-swap updates, not an enum.
+- Inferred states. None, pending, running, completed, failed.
+- Inferred transitions. Request sets pending only from null, completed, or failed. The watcher promotes pending to running. Success sets completed. Give-up sets failed, and the SQL can restrict the source states. Shutdown can fail every running row.
+- Illegal combinations. `pending` with a null platform. `running` after the process that claimed it died. `completed` with `handoff_error` still set. A second request while state is `running` returns false. The column still allows a writer to skip the CAS.
+- Why it matters. Desktop, TUI, and CLI can open the same session and each believe it owns the handoff. A crashed running row blocks the next move until something fails it.
+- Confidence. High.
+- Origin. Upstream.
+
+### 37. DM pairing
+
+- Files and symbols. `gateway/pairing.py` `PairingStore` (`generate_code`, `approve_code`, `_pending_path`, `_rate_limits.json`, lockout helpers).
+- Implicit representation. Pending codes live in `{platform}-pending.json` as salted hashes. Approved users live in another file. Rate limits and lockout counters live in `_rate_limits.json`. There is no pairing-state enum. Phase is "which file contains this user" plus the counters.
+- Inferred states. Unknown, code issued, approved, rate-limited, platform locked out.
+- Inferred transitions. An unknown DM generates a code unless the cap, the rate limit, or the lockout says no. Approve matches the hash, writes the allowlist, and clears the failure streak. Wrong codes increment the streak. TTL cleanup drops old pending rows.
+- Illegal combinations. More than the pending cap. A user in both pending and approved. Lockout with a fresh code still issued. A pending file and an approved file that name different ids for one person.
+- Why it matters. A stranger gets a code during lockout, or a legitimate user stays locked after a successful approve if the streak is not cleared. The code path does clear it. A second writer can put it back.
+- Confidence. High.
+- Origin. Upstream.
+
+### 38. Hermes update lock
+
+- Files and symbols. `hermes_cli/update_lock.py` (marker `.hermes-update-in-progress`, `incarnation_live`, `UPDATE_EXIT_CONCURRENT`). The checkout flock is `hermes-update.lock`.
+- Implicit representation. Two artifacts. The marker is pid, start time, and creation time, plus an optional delegate line. The checkout lock is a kernel flock held by the process tree. Liveness is pid plus creation time, not file age. Finding 21 is the receipt stage list. This one is who may enter the pipeline.
+- Inferred states. Idle, marker held, checkout locked, delegate child still holding the lock after the parent died, concurrent updater refused.
+- Inferred transitions. Update writes the marker and takes the flock. A second update exits 2. A killed parent leaves the flock to the completion child. A v1 marker with no creation time ages out. `incarnation_live` refuses a recycled pid.
+- Illegal combinations. Marker present and flock free. Flock held and marker missing. Two live owners on one marker without a delegate line. Desktop and CLI both treating a stale v1 marker as a live update.
+- Why it matters. Two updates rewrite one checkout. A dead marker blocks every later update. A recycled pid is treated as the updater and the new update is refused.
+- Confidence. High.
+- Origin. Upstream.
+
+### 39. Full-text index rebuild
+
+- Files and symbols. `hermes_state_fts.py` (`FTS_STALE_KEY`, rebuild progress comments). `hermes_state_common.py` exports the stale keys.
+- Implicit representation. `state_meta` keys mark the index stale and store a high-water mark and progress. Triggers attach only when the marker says the index is current. There is no rebuild-phase enum.
+- Inferred states. Healthy, stale, rebuild admitted, rebuilding, deferred after a lock or corruption.
+- Inferred transitions. A corruption detector sets the stale key and detaches triggers. An admission claim starts the rebuild. Progress advances the high-water row. Success clears the marker and reattaches triggers. A lock or a busy writer defers.
+- Illegal combinations. Triggers attached while the stale key is set. Progress past the high-water mark. Two rebuilders, because the admission row was not claimed. A CJK index and the trigram index disagreeing about which marker is current.
+- Why it matters. Search returns nothing, or a trigger writes into a stale external-content index and corrupts it. The file's own comment describes that hazard.
+- Confidence. Medium. The marker and the rebuild comment were read. The full admission function was not.
+- Origin. Upstream.
+
 ## Already explicit
 
 These are single sources of truth. They are not re-listed above.
@@ -352,10 +508,10 @@ Cron execution status has a SQL check. Finding 5 stays in the implicit list beca
 - Other git branches on the fork (`UI`, `architecture-planning`, and the rest) were not checked out. Only `main` at `d97007c` was read.
 - Upstream history after that commit was not read. Current `NousResearch/hermes-agent` `main` is thousands of commits ahead of this snapshot.
 - A shallow fetch of upstream could not recompute a merge base in this clone. The GitHub commit API confirms `d97007c` exists on `NousResearch/hermes-agent`, and the fork compare reports zero commits ahead.
-- Platform adapters under `gateway/platforms/` and `plugins/platforms/` were not each line-read. Finding 7 and finding 18 stop at `base.py`. Private reconnect loops in Telegram, Slack, and the other adapters may be further machines.
-- `plugins/` outside the kanban and connector paths, the skill curator, and image-generation jobs were not opened for lifecycle flags.
+- Platform adapters under `gateway/platforms/` and `plugins/platforms/` were not each line-read. Finding 7, finding 18, and finding 30 stop at the base adapter and the reconnect queue. Private reconnect loops in Telegram, Slack, and the other adapters may be further machines.
+- `plugins/` outside the kanban and connector paths, the skill curator, and image-generation jobs were not opened far enough to number a machine. Image generation in `plugins/image_gen/` looks like a synchronous HTTP call, not a job queue.
 - The website catalog UI, `evals/`, and test fixtures were skipped except where a test name pointed at a production symbol.
 - Generated files, lockfiles, and vendored dependency trees were skipped.
-- TUI session attach was not given its own finding. The socket phase is the explicit `ConnectionState` above. Per-session RPC work beyond that was not fully traced.
 - Streaming draft seals (`draft_stream_is_message`, interim-send metadata) are a delivery protocol described in `gateway/AGENTS.md`. The adapter implementations were not read line by line, so that protocol is not a numbered finding.
-- OAuth device-code polling inside MCP, apart from `_auth_park` on `MCPServerTask`, was not mapped as its own machine. Nous sign-in is the explicit `SignInState` flow.
+- OAuth device-code polling inside MCP, apart from `_auth_park` on `MCPServerTask`, was not mapped as its own machine. Nous sign-in is the explicit `SignInState` flow. A dashboard MCP OAuth worker (`hermes_cli/web_server_mcp.py`, `tools/mcp_dashboard_oauth.py`) uses a string `status` plus events. It was not given its own entry.
+- These were opened far enough to see a lifecycle and then left unnumbered because they sit inside a finding above, or the transition list was not read through. Cron `fire_claim` and `run_claim` (`cron/jobs.py`) sit inside finding 4. The ticker heartbeat files sit beside finding 4. `gateway/turn_lease.py` and `hermes_state_compression.py` lease rows sit beside finding 8 and finding 14. `agent/interrupt_control.py` and `CompressionCommitFence` sit beside finding 13 and finding 14. `hermes_startup_watchdog.py` is a deadline plus a lease phase string. `hermes_cli/onboarding_due.py` is a cache generation. `tools/terminal_tool_lifecycle.py` and the Docker, Modal, and Vercel environment classes are per-task caches with nullable handles. `web/src/lib/pty-reconnect.ts` adds in-flight flags on top of an explicit PTY union. `apps/desktop/src/plugins/hermes-bots/relay.ts` retains sockets across a drain loop. `hermes_state_registry.py` refcounts a SessionDB generation.
